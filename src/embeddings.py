@@ -37,14 +37,13 @@ def extract_questions_by_position(position, text):
       pos_count = 1
     #compute embeddings for ChatGpt questions
     if "ChatGPT" in sub and "?" in sub:
-      if pos_count == position:
+      if pos_count in position:
         question = extract_question(sub)
         if question is not None:
-          pos_count = None
           all_questions_with_duplicates_position.append(question)
-      else:
-        if pos_count is not None and extract_question(sub) is not None: 
-          pos_count += 1
+        else: 
+          pos_count -=1 
+      pos_count += 1
   return all_questions_with_duplicates_position
 
 def cluster(n_clusters, data):

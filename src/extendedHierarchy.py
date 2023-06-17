@@ -2607,7 +2607,7 @@ def set_link_color_palette(palette):
     _link_line_colors = palette
 
 
-def dendrogram(Z, p=30, truncate_mode=None, color_threshold=None, truncate_threshold=0.5,
+def dendrogram(Z, p=30, truncate_mode=None, color_threshold=None, truncate_threshold=0.5, min_clus_size = None,
                get_leaves=True, orientation='top', labels=None,
                count_sort=False, distance_sort=False, show_leaf_counts=True,
                no_plot=False, no_labels=False, leaf_font_size=None,
@@ -2651,6 +2651,12 @@ def dendrogram(Z, p=30, truncate_mode=None, color_threshold=None, truncate_thres
           A "level" includes all nodes with ``p`` merges from the final merge.
           Note: ``'mtica'`` is an alias for ``'level'`` that's kept for
           backward compatibility.
+        ``'threshold'``
+          clusters are formed based on distance below certain value specified by ``truncate_theshold``
+    truncate_threshold: double, optional
+        parameter for truncate_mode 'threshold'
+    min_clus_size: int, optional
+        the minimum number of leaves within a cluster that are necessary for the cluster to be added to the dendrogram
     color_threshold : double, optional
         For brevity, let :math:`t` be the ``color_threshold``.
         Colors all the descendent links below a cluster node
@@ -2859,6 +2865,9 @@ def dendrogram(Z, p=30, truncate_mode=None, color_threshold=None, truncate_thres
     if truncate_mode not in ('lastp', 'mtica', 'level', 'threshold', 'none', None):
         # 'mtica' is kept working for backwards compat.
         raise ValueError('Invalid truncation mode.')
+    
+    if truncate_mode != 'threshold' and min_clus_size is not None and min_clus_size > 1:
+         raise ValueError('Can only set min_clus_size for truncation_mode: threshold')
 
     if truncate_mode == 'lastp':
         if p > n or p == 0:
@@ -2872,6 +2881,10 @@ def dendrogram(Z, p=30, truncate_mode=None, color_threshold=None, truncate_thres
     if truncate_mode == 'level' or truncate_mode == 'threshold':
         if p <= 0:
             p = np.inf 
+    if type(min_clus_size) is not int and min_clus_size is not None:
+        raise TypeError('The min_clus_size must be a number or None')
+    if min_clus_size is not None and min_clus_size <= 0:
+        min_clus_size = None
 
     if get_leaves:
         lvs = []
@@ -2902,6 +2915,7 @@ def dendrogram(Z, p=30, truncate_mode=None, color_threshold=None, truncate_thres
         truncate_mode=truncate_mode,
         truncate_threshold = truncate_threshold, 
         color_threshold=color_threshold,
+        min_clus_size=min_clus_size,
         get_leaves=get_leaves,
         orientation=orientation,
         labels=labels,
@@ -3025,7 +3039,7 @@ def _get_truncated_leaves(Z, clus_id, i, n, truncated_leaves, labels):
 
 # NEW: truncate_threshold, truncated_leaves
 def _dendrogram_calculate_info(Z, p, truncate_mode, truncate_threshold, 
-                               color_threshold=np.inf, get_leaves=True,
+                               color_threshold=np.inf, min_clus_size=None,get_leaves=True,
                                orientation='top', labels=None,
                                count_sort=False, distance_sort=False,
                                show_leaf_counts=False, i=-1, iv=0.0,
@@ -3108,6 +3122,8 @@ def _dendrogram_calculate_info(Z, p, truncate_mode, truncate_threshold,
     elif truncate_mode == 'threshold':     
         if i > n and Z[i - n, 2] < truncate_threshold and truncate_threshold > 0 and int(Z[i - n, 3]) < p: 
             d = Z[i - n, 2]
+            if min_clus_size is not None and int(Z[i - n, 3]) < min_clus_size:
+                return (None, None, None, None)
             _append_nonsingleton_leaf_node(Z, p, n, level, lvs, ivl,
                                            leaf_label_func, i, labels,
                                            show_leaf_counts, truncated_leaves)
@@ -3116,8 +3132,12 @@ def _dendrogram_calculate_info(Z, p, truncate_mode, truncate_threshold,
             
             return (iv + 5.0, 10.0, 0.0, d)
         elif i < n:
+            
+            if min_clus_size is not None and min_clus_size > 1: 
+                return (None, None, None, None)
+
             _append_singleton_leaf_node(Z, p, n, level, lvs, ivl,
-                                        leaf_label_func, i, labels, truncated_leaves)
+                                       leaf_label_func, i, labels, truncated_leaves)
             
             return (iv + 5.0, 10.0, 0.0, 0.0)
         
@@ -3125,8 +3145,10 @@ def _dendrogram_calculate_info(Z, p, truncate_mode, truncate_threshold,
     #
     # Only place leaves if they correspond to original observations.
     if i < n:
+        if min_clus_size is not None and min_clus_size > 1: 
+                return (None, None, None, None)
         _append_singleton_leaf_node(Z, p, n, level, lvs, ivl,
-                                    leaf_label_func, i, labels, truncated_leaves)
+                                   leaf_label_func, i, labels, truncated_leaves)
         return (iv + 5.0, 10.0, 0.0, 0.0)
 
     # !!! Otherwise, we don't have a leaf node, so work on plotting a
@@ -3201,6 +3223,7 @@ def _dendrogram_calculate_info(Z, p, truncate_mode, truncate_threshold,
             truncate_mode=truncate_mode,
             truncate_threshold=truncate_threshold,
             color_threshold=color_threshold,
+            min_clus_size=min_clus_size,
             get_leaves=get_leaves,
             orientation=orientation,
             labels=labels,
@@ -3230,44 +3253,105 @@ def _dendrogram_calculate_info(Z, p, truncate_mode, truncate_threshold,
     else:
         currently_below_threshold[0] = True
         c = _link_line_colors[current_color[0]]
-    (uivb, uwb, ubh, ubmd) = \
-        _dendrogram_calculate_info(
-            Z=Z, p=p,
-            truncate_mode=truncate_mode,
-            truncate_threshold=truncate_threshold,
-            color_threshold=color_threshold,
-            get_leaves=get_leaves,
-            orientation=orientation,
-            labels=labels,
-            count_sort=count_sort,
-            distance_sort=distance_sort,
-            show_leaf_counts=show_leaf_counts,
-            i=ub, iv=iv + uwa, ivl=ivl, n=n,
-            icoord_list=icoord_list,
-            dcoord_list=dcoord_list, lvs=lvs,
-            current_color=current_color,
-            color_list=color_list,
-            currently_below_threshold=currently_below_threshold,
-            leaf_label_func=leaf_label_func,
-            level=level + 1, contraction_marks=contraction_marks,
-            truncated_leaves=truncated_leaves, 
-            link_color_func=link_color_func,
-            above_threshold_color=above_threshold_color)
 
-    max_dist = max(uamd, ubmd, h)
+    if uwa is not None: 
+        (uivb, uwb, ubh, ubmd) = \
+            _dendrogram_calculate_info(
+                Z=Z, p=p,
+                truncate_mode=truncate_mode,
+                truncate_threshold=truncate_threshold,
+                color_threshold=color_threshold,
+                min_clus_size=min_clus_size,
+                get_leaves=get_leaves,
+                orientation=orientation,
+                labels=labels,
+                count_sort=count_sort,
+                distance_sort=distance_sort,
+                show_leaf_counts=show_leaf_counts,
+                i=ub, iv=iv + uwa, ivl=ivl, n=n,
+                icoord_list=icoord_list,
+                dcoord_list=dcoord_list, lvs=lvs,
+                current_color=current_color,
+                color_list=color_list,
+                currently_below_threshold=currently_below_threshold,
+                leaf_label_func=leaf_label_func,
+                level=level + 1, contraction_marks=contraction_marks,
+                truncated_leaves=truncated_leaves, 
+                link_color_func=link_color_func,
+                above_threshold_color=above_threshold_color)
+    else: 
+        (uivb, uwb, ubh, ubmd) = \
+            _dendrogram_calculate_info(
+                Z=Z, p=p,
+                truncate_mode=truncate_mode,
+                truncate_threshold=truncate_threshold,
+                color_threshold=color_threshold,
+                min_clus_size=min_clus_size,
+                get_leaves=get_leaves,
+                orientation=orientation,
+                labels=labels,
+                count_sort=count_sort,
+                distance_sort=distance_sort,
+                show_leaf_counts=show_leaf_counts,
+                i=ub, iv=iv, ivl=ivl, n=n,
+                icoord_list=icoord_list,
+                dcoord_list=dcoord_list, lvs=lvs,
+                current_color=current_color,
+                color_list=color_list,
+                currently_below_threshold=currently_below_threshold,
+                leaf_label_func=leaf_label_func,
+                level=level + 1, contraction_marks=contraction_marks,
+                truncated_leaves=truncated_leaves, 
+                link_color_func=link_color_func,
+                above_threshold_color=above_threshold_color)
+    if (uivb, uwb, ubh, ubmd) != (None, None, None, None) and (uiva, uwa, uah, uamd) != (None, None, None, None): 
+        max_dist = max(uamd, ubmd, h)
 
-    icoord_list.append([uiva, uiva, uivb, uivb])
-    dcoord_list.append([uah, h, h, ubh])
-    if link_color_func is not None:
-        v = link_color_func(int(i))
-        if not isinstance(v, str):
-            raise TypeError("link_color_func must return a matplotlib "
-                            "color string!")
-        color_list.append(v)
+        
+        #adjusts length of links (neede bc of ignored child-links)
+        if min_clus_size is not None:
+            x_coor = uiva + uivb / 2
+            uah_adjust = 0
+            ubh_adjust = 0
+            vertical_point = h
+            has_child_left = False
+            has_child_right = False
+            #check if there is a child link-middle point with the same x-coordinate as the current link
+            for i in range(len(icoord_list)):
+                x_coor = (icoord_list[i][0] + icoord_list[i][2]) / 2
+                if x_coor == uiva:
+                    has_child_left = True
+                    uah_adjust = uah - dcoord_list[i][1]
+                if x_coor == uivb:
+                    has_child_right = True
+                    ubh_adjust = ubh - dcoord_list[i][1]
+            #else the link goes to a leaf node
+            if has_child_left is False: 
+                uah = 0.0
+            if has_child_right is False: 
+                ubh = 0.0
+            
+            dcoord_list.append([uah- uah_adjust, h, h, ubh - ubh_adjust])
+        else: 
+            dcoord_list.append([uah, h, h, ubh])
+        icoord_list.append([uiva, uiva, uivb, uivb])
+
+        if link_color_func is not None:
+            v = link_color_func(int(i))
+            if not isinstance(v, str):
+                raise TypeError("link_color_func must return a matplotlib "
+                                "color string!")
+            color_list.append(v)
+        else:
+            color_list.append(c)
+        return (((uiva + uivb) / 2), uwa + uwb, h, max_dist)
+    elif (uivb, uwb, ubh, ubmd) == (None, None, None, None) and  (uiva, uwa, uah, uamd) == (None, None, None, None): 
+        return  (None, None, None, None)
+    elif (uivb, uwb, ubh, ubmd) == (None, None, None, None) and  (uiva, uwa, uah, uamd) != (None, None, None, None): 
+        return ((uiva), uwa, h, max(uamd, h))
     else:
-        color_list.append(c)
-
-    return (((uiva + uivb) / 2), uwa + uwb, h, max_dist)
+        return (((uivb)), uwb, h, max(ubmd, h))
+        
 
 
 def is_isomorphic(T1, T2):

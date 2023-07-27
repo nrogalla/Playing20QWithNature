@@ -1,10 +1,11 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import copy
-from scipy.stats import pearsonr, spearmanr
-from scipy.spatial.distance import pdist, squareform, correlation
-
+import rsatoolbox
+import rsatoolbox.data as rsd
+import rsatoolbox.rdm as rsr
+import tqdm
+from scipy import stats
+import scipy
 
 # extracts stimulus from metadata 
 def get_stimulus_data(stim_f):
@@ -15,530 +16,462 @@ def get_stimulus_data(stim_f):
     temp[['stimulus', 'r1', 'r2']] = testdata['stimulus'].str.rsplit('_', expand= True)
     
     for t in temp.index:
-        if temp['r2'][t] is None:
-            testdata['stimulus'][t] = temp['stimulus'][t]
-        else: 
-            testdata['stimulus'][t] = temp['stimulus'][t]+temp['r1'][t]
+         with pd.option_context('mode.chained_assignment', None):
+            if temp['r2'][t] is None:
+                testdata['stimulus'][t] = temp['stimulus'][t]
+            else: 
+                testdata['stimulus'][t] = temp['stimulus'][t]+temp['r1'][t]
     return testdata
 
-# computes the RDM from fMRI betas, sorted by given function 
-# returns the RDM and the sorted list of corresponding stimuli
-def compute_rdm_per_subject(response_data, meta_data, sort_function = None):
-    '''
-    Parameters
-    ----------
-    response_data: numpy array with fMRI betas per trail
-    meta_data: dataframe with stimulus column
-    sort_function: function that determines how the RDM is to be sorted
+def select_voxels_av_activation(response_data_subj, number_of_voxels):
+    average_activation_per_voxel = np.average(response_data_subj, axis = 0)
+    ind = np.argpartition(average_activation_per_voxel, -number_of_voxels)[-number_of_voxels:]
+    sorted_ind = ind[np.argsort(ind)]
+    return sorted_ind
 
-    Returns
-    -------
-    rdm: Representational distance matrix over stimuli sorted by sort_function
-    stimulus_list: list of stimuli sorted as in rdm
-    '''
-    
-    if len(response_data) != len(meta_data):
-        return 'Invalid input: response data and meta data must be of same length'
-    
-    #link meta_data to response_data and reduce dataset to needed columns
-    df_response_data = pd.DataFrame(response_data)
-    full_data = pd.merge(meta_data, df_response_data, left_index = True, right_index = True)
-    
-    reduced_data = full_data.drop(["Unnamed: 0", "session", "run", "subject_id", "trial_id", "trial_type"], axis = 1)
-    
-    # average data across stimuli
-    df_averaged_response_data = reduced_data.groupby(['stimulus']).mean().reset_index()
-    
-    if sort_function is not None: 
-        df_averaged_response_data = df_averaged_response_data.assign(sort = lambda df: sort_function(df['stimulus'].tolist()))
-        #exclude data that does not strictly fall into the categories
-        df_averaged_response_data = df_averaged_response_data[df_averaged_response_data['sort'] != -1]
-        #sort values according to category distinction
-        df_averaged_response_data = df_averaged_response_data.sort_values(['sort', 'stimulus'], ignore_index = True, ascending = True).drop('sort', axis='columns')
-        
-    stimulus_list = df_averaged_response_data['stimulus']
-    df_sorted_data = df_averaged_response_data.drop(['stimulus'], axis = 1).to_numpy()
-    
-    # compute rdm    
-    rdm_list = pdist(df_sorted_data, metric = 'correlation')
-    rdm = squareform(rdm_list)
+def select_voxels_noise_cutoff(noise_ceil_sub, cutoff):
+    noise_ceil_sub = noise_ceil_sub.reshape(np.shape(noise_ceil_sub)[0],)
+    ind = np.where(noise_ceil_sub>cutoff)[0]
+    return ind
 
-    return rdm, stimulus_list
-
-def compute_rdm(response_data, meta_data, sort_function = None):
-
-    if len(response_data) != len(meta_data):
-        return 'Invalid input: response data and meta data must must be of same subject number'
-    rdms = []
-    for i in range(len(response_data)):
-        rdm, stimuli_list = compute_rdm_per_subject(response_data[i], meta_data[i], sort_function)
-        rdms.append(rdm)
-    #average across subject RDMs
-    return np.average(rdms, axis = 0), stimuli_list
-
-# computes the RDM from fMRI betas, sorted by given function 
-# returns the RDM and the sorted list of corresponding stimuli
-def compute_rdm_session(response_data, meta_data, sort_function = None):
-    '''
-    Parameters
-    ----------
-    response_data: numpy array with fMRI betas per trail
-    meta_data: dataframe with stimulus column
-    sort_function: function that determines how the RDM is to be sorted
-
-    Returns
-    -------
-    rdm: Representational distance matrix over stimuli sorted by sort_function
-    df_sorted['stimulus']: list of stimuli sorted as in rdm
-    '''
-    if len(response_data) != len(meta_data):
-        return 'Invalid input: response data and meta data must be of same length'
-    df_response_data = pd.DataFrame(response_data)
-    merged_data = pd.merge(meta_data, df_response_data, left_index = True, right_index = True)
-    reduced_data = merged_data.drop(["Unnamed: 0", "run", "subject_id", "trial_id", "trial_type"], axis =1)
-    session_rdms = []
-    n_sessions = len(np.unique(np.array(reduced_data['session'])))
-
-    #compute rdm per session and add to list of session_rdms
-    for i in range(n_sessions):
-        reduced_data_session = reduced_data[reduced_data['session']==i+1]
-        if sort_function is not None: 
-            df_averaged_response_data = reduced_data_session.assign(sort = lambda df: sort_function(df['stimulus'].tolist()))
-            df_averaged_response_data = df_averaged_response_data[df_averaged_response_data['sort'] != -1]
-            df_sorted = df_averaged_response_data.sort_values(['sort', 'stimulus'], ignore_index = True, ascending = True).drop('sort', axis='columns')
-            stimulus_list = df_sorted['stimulus']
-            df_sorted_data= df_sorted.drop(['stimulus', 'session'], axis = 1)
-            df_sorted_data = df_sorted_data.to_numpy()
+def get_dataset_subset(response_data, meta_data, number_of_voxels, noise_ceil, cut_off): 
+    data = []
+    nSubj = len(response_data)
+    for i in np.arange(nSubj):
+        des = {'subj': i+1}
+        response_data_subj = response_data[i]
+        meta_data_subj = meta_data[i]
+        df_response_data_subj = pd.DataFrame(response_data_subj)
+        if noise_ceil is not None and cut_off is not None: 
+            sorted_ind = select_voxels_noise_cutoff(noise_ceil[i], cut_off)
         else: 
-            stimulus_list = reduced_data_session['stimulus']
-            df_sorted_data = reduced_data_session.drop(['stimulus', 'session'], axis = 1).to_numpy()
-            
-        rdm_list = pdist(df_sorted_data, metric = 'correlation')
-        rdm = squareform(rdm_list)
-        session_rdms.append(rdm)
-
-    #average over all session_rdms
-    subject_rdm = np.average(session_rdms, axis = 0)
-
-    return subject_rdm, stimulus_list
-
-' a function for plotting the RDM '
-def plot_rdm(rdm, percentile=False, rescale=False, lim=[0, 1], conditions=None, con_fontsize=16, cmap=None, title=None,
-             title_fontsize=16):
-
-    """
-    Plot the RDM
-    Parameters
-    ----------
-    rdm : array or list [n_cons, n_cons]
-        A representational dissimilarity matrix.
-    percentile : bool True or False. Default is False.
-        Rescale the values in RDM or not by displaying the percentile.
-    rescale : bool True or False. Default is False.
-        Rescale the values in RDM or not.
-        Here, the maximum-minimum method is used to rescale the values except for the
-        values on the diagnal.
-    lim : array or list [min, max]. Default is [0, 1].
-        The corrs view lims.
-    conditions : string-array or string-list. Default is None.
-        The labels of the conditions for plotting.
-        conditions should contain n_cons strings, If conditions=None, the labels of conditions will be invisible.
-    con_fontsize : int or float. Default is 12.
-        The fontsize of the labels of the conditions for plotting.
-    cmap : matplotlib colormap. Default is None.
-        The colormap for RDM.
-        If cmap=None, the ccolormap will be 'jet'.
-    title : string-array. Default is None.
-        The title of the figure.
-    title_fontsize : int or float. Default is 16.
-        The fontsize of the title.
-    """
-
-    if len(np.shape(rdm)) != 2 or np.shape(rdm)[0] != np.shape(rdm)[1]:
-
-        return "Invalid input!"
-
-    # get the number of conditions
-    cons = rdm.shape[0]
-
-    crdm = copy.deepcopy(rdm)
-
-    # if cons=2, the RDM cannot be plotted.
-    if cons == 2:
-        print("The shape of RDM cannot be 2*2.")
-
-        return None
-   
-    # determine if it's a square
-    a, b = np.shape(crdm)
-    if a != b:
-        return None
-
-    if percentile == True:
-
-        v = np.zeros([cons * cons, 2], dtype=float)
-        for i in range(cons):
-            for j in range(cons):
-                v[i * cons + j, 0] = crdm[i, j]
-
-        index = np.argsort(v[:, 0])
-        m = 0
+            sorted_ind = select_voxels_av_activation(response_data_subj, number_of_voxels)
+        full_data = pd.merge(meta_data_subj, df_response_data_subj, left_index = True, right_index = True).drop(["Unnamed: 0", "session", "run", "subject_id", "trial_id", "trial_type"], axis = 1)
         
-        for i in range(cons * cons):
-            if i > 0:
-                if v[index[i], 0] > v[index[i - 1], 0]:
-                    m = m + 1
-                v[index[i], 1] = m
+        stimulus_list_subj_session = full_data['stimulus']
+        
+        response_data_subj_sess = full_data.drop(['stimulus'], axis = 1).to_numpy()
+        
+        chn_des = {'voxels': np.array([x for x in df_response_data_subj.columns])}
+        obs_des = {'conds': np.array([str(x) for x in stimulus_list_subj_session])} 
+        data_obj = rsd.Dataset(measurements=response_data_subj_sess,
+                                descriptors=des,
+                                obs_descriptors=obs_des,
+                                channel_descriptors=chn_des)
+        data_subset = data_obj.subset_channel(by = 'voxels', value = sorted_ind )
+        data_av, stim_list_average, _ = rsatoolbox.data.average_dataset_by(data_subset, 'conds') 
+        
+        obs_des = {'conds': np.array([str(x) for x in stim_list_average])} 
+        
+        data_obj_av = rsd.Dataset(measurements=data_av,
+                                descriptors=des,
+                                obs_descriptors=obs_des,
+                                channel_descriptors=data_subset.channel_descriptors)
+        data.append(data_obj_av)
+        
+    return data
 
-        v[:, 0] = v[:, 1] * 100 / m
+def sort_rdm(rdm, sort_function):
+   
+    conds_df = pd.DataFrame(columns = ['stimulus'])
+    conds_df['stimulus'] = rdm.pattern_descriptors['conds']
+    conds_df = conds_df.assign(sort = lambda df: sort_function(df['stimulus'].tolist()))
+    #exclude data that does not strictly fall into the categories
+    conds_df = conds_df[conds_df['sort'] != -1]
+    #sort values according to category distinction
+    sorted_conds_df = conds_df.sort_values(['sort', 'stimulus'], ascending = True).drop('sort', axis='columns')
+    sorted_ind = sorted_conds_df.index
+    rdm.reorder(sorted_ind)
+    return rdm
 
-        for i in range(cons):
-            for j in range(cons):
-                crdm[i, j] = v[i * cons + j, 0]
-        if cmap == None:
-            plt.imshow(crdm, extent=(0, 1, 0, 1), cmap=plt.cm.jet, clim=(0, 100))
-        else:
-            plt.imshow(crdm, extent=(0, 1, 0, 1), cmap=cmap, clim=(0, 100))
-
-    # rescale the RDM
-    elif rescale == True:
-
-        # flatten the RDM
-        vrdm = np.reshape(rdm, [cons * cons])
-        # array -> set -> list
-        svrdm = set(vrdm)
-        lvrdm = list(svrdm)
-        lvrdm.sort()
-
-        # get max & min
-        maxvalue = lvrdm[-1]
-        minvalue = lvrdm[1]
-
-        # rescale
-        if maxvalue != minvalue:
-
-            for i in range(cons):
-                for j in range(cons):
-
-                    # not on the diagnal
-                    if i != j:
-                        crdm[i, j] = float((crdm[i, j] - minvalue) / (maxvalue - minvalue))
-
-        # plot the RDM
-        min = lim[0]
-        max = lim[1]
-        if cmap == None:
-            plt.imshow(crdm, extent=(0, 1, 0, 1), cmap=plt.cm.jet, clim=(min, max))
-        else:
-            plt.imshow(crdm, extent=(0, 1, 0, 1), cmap=cmap, clim=(min, max))
-
-    else:
-        # plot the RDM
-        min = lim[0]
-        max = lim[1]
-        if cmap == None:
-            plt.imshow(crdm, extent=(0, 1, 0, 1), cmap=plt.cm.jet, clim=(min, max))
-        else:
-            plt.imshow(crdm, extent=(0, 1, 0, 1), cmap=cmap, clim=(min, max))
-
-    cb = plt.colorbar()
-    cb.ax.tick_params(labelsize=16)
-    font = {'size': 18}
-
-    if percentile == True:
-        cb.set_label("Dissimilarity (percentile)", fontdict=font)
-    elif rescale == True:
-        cb.set_label("Dissimilarity (Rescaling)", fontdict=font)
-    else:
-        cb.set_label("Dissimilarity", fontdict=font)
-
-    if conditions is not None and conditions.any() is not None:
-        step = float(1 / cons)
-        x = np.arange(0.5 * step, 1 + 0.5 * step, step)
-        y = np.arange(1 - 0.5 * step, -0.5 * step, -step)
-        plt.xticks(x, conditions, fontsize=con_fontsize, rotation=90, ha="right")
-        plt.yticks(y, conditions, fontsize=con_fontsize)
-    else:
-        plt.axis("off")
-
-    plt.title(title, fontsize=title_fontsize)
-
-    plt.show()
-
-    return 0
-
+def get_models(mean_RDM_corr, functions, category_name_list, subset = None):
+    if len(functions) != len(category_name_list):
+        raise ValueError('number of supplied functions should equal length of category_name_list')
+    model_rdms = []
+    for i in range(len(functions)): 
+        if subset == None: 
+            model_rdms.append(rsr.get_categorical_rdm(np.array(functions[i](mean_RDM_corr.pattern_descriptors['conds'])), category_name=category_name_list[i]))
+        else: 
+            rdm = rsr.get_categorical_rdm(np.array(functions[i](mean_RDM_corr.pattern_descriptors['conds'])), category_name=category_name_list[i])
+            subset_rdm = rdm.subset_pattern(by = category_name_list[i], value = subset)
+            model_rdms.append(subset_rdm)
+    models = []
+    for i in range(len(model_rdms)): 
+        models.append(rsatoolbox.model.ModelFixed(category_name_list[i], model_rdms[i]))
+    return model_rdms, models
 
 # sort function for animacy distinction
-def get_value_animacy(stimulus_list): 
+def get_value_animacy_pictures(stimulus_list): 
+    
     distinction_list = []
     for stimulus in stimulus_list:
-        #animals: mammals
         if stimulus in ('cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse',  'monkey', 
-                        'rabbit', 'boa', 'alligator', 'butterfly', 'chest1', 'dragonfly',  'iguana', 'starfish', 'wasp'):
+                        'rabbit', 'alligator', 'butterfly', 'iguana', 'starfish', 'wasp', 'dragonfly', 'chest1', 'bamboo'):
                         #'bamboo', 'bean'):
             distinction_list.append(0)
         else:
             distinction_list.append(1)
     return distinction_list
 
+def get_value_animals_pictures(stimulus_list): 
+    
+    distinction_list = []
+    for stimulus in stimulus_list:
+        if stimulus in ('cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse',  'monkey', 
+                        'rabbit', 'alligator', 'butterfly', 'iguana', 'starfish', 'wasp', 'dragonfly'):
+                        #'bamboo', 'bean'):
+            distinction_list.append(0)
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def normalize_rdms(rdms_list): 
+    normalized_rdms_list = []
+    for rdm in rdms_list:
+        normalized_rdms_list.append(stats.zscore(rdm.get_vectors()[0]))
+    return normalized_rdms_list
+
 # sort function for indoors distinction
-def get_value_indoors(stimulus_list): 
+def get_value_indoors_pictures(stimulus_list): 
     distinction_list = []
     for stimulus in stimulus_list:
         #indoors
-        if stimulus in ('altar', 'bed', 'dough', 'candelabra', 'coatrack', 'blind', 'crayon', 
-                           'drain', 'drawer','easel', 'grate', 'jam', 'jar', 'joystick', 'lasanga', 'microscope', 'mousetrap', 'pan',
-                          'piano', 'quill', 'ribbon', 'shredder', 'spoon', 'television', 'typewriter', 'urinal', 'wallpaper', 'whip'):
+        if stimulus in ('altar', 'ashtray', 'banana', 'beachball', 'bed', 'beer', 'blind', 'boa', 'bobsled', 'brace', 'brownie', 'candelabra', 'cheese', 'chest1', 
+                        'clipboard', 'coatrack', 'cookie', 'crank', 'crayon', 'cufflink', 'donut', 'dough', 'drawer', 'dress', 'earring', 'fudge', 'guacamole', 'horseshoe',
+                        'jar', 'joystick', 'kazoo', 'key', 'kimono', 'lasagna', 'lemonade', 'mango', 'microscope', 'mosquitonet', 'mousetrap', 'pacifier', 'pan', 
+                        'piano', 'quill', 'ribbon', 'shredder', 'simcard', 'speaker', 'spoon', 'tamale', 'television', 't-shirt', 'typewriter', 'urinal', 
+                        'wallpaper', 'watch', 'wig'):
             distinction_list.append(0)
-        #not classifiable
-        elif stimulus in ('chest1', 'pumpkin', 'pear', 'peach', 'pacifier', 'marshmallow', 'mango', 'lemonade', 'kimono', 'key', 'uniform',
-                          'kazoo', 't-shirt', 'speaker', 'simcard', 'tamale', 'donut', 'cufflink', 'crank', 'cookie', 'clipboard', 'beer', 'watch',
-                          'cheese', 'brownie', 'brace', 'bobslet', 'bean', 'hulahoop', 'guacamole', 'grape', 'fudge', 'earring', 'dress', 'wig'):
-            distinction_list.append(-1)
-        #outdoors
         else:
             distinction_list.append(1)
     return distinction_list
 
 # sort function for size (compared to breadbox) distinction
-def get_value_size(stimulus_list): 
+def get_value_size_pictures(stimulus_list): 
     distinction_list = []
     for stimulus in stimulus_list:
-        #animals: mammals
-        if stimulus in ('banana', 'butterfly', 'grape', 'key', 'spoon', 'wasp', 'ashtray', 'bean', 'beer', 'brace', 'brownie', 'cheese',
-                        'chipmunk', 'clipboard', 'cookie', 'crayon', 'cufflink', 'donut', 'dough', 'dragonfly', 'drain', 'dress', 'earring',
-                        'footprint', 'fudge','grate', 'guacamole', 'headlamp', 'horseshoe', 'jam', 'joystick', 'kazoo', 'kimono',
-                        'lasanga', 'lemonade', 'mango','marshmallow', 'mosquitonet', 'mousetrap', 'pacifier', 'peach', 'pear', 'quill', 
-                        'ribbon', 'simcard', 'starfish', 't-shirt', 'tamale', 'uniform', 'watch', 'whip', 'wig'):
+        'smaller'
+        if stimulus in ('banana', 'boa', 'butterfly', 'grape', 'key', 'spoon', 'wasp', 'ashtray', 'bean', 'beer', 'brownie', 'dress', 'cheese',
+                        'chipmunk', 'clipboard', 'cookie', 'crayon', 'crank', 'cufflink', 'donut', 'dough', 'dragonfly', 'earring',
+                        'footprint', 'fudge', 'guacamole', 'headlamp', 'horseshoe', 'jam', 'joystick', 'kazoo',
+                        'lasagna', 'lemonade', 'mango','marshmallow', 'mosquitonet', 'mousetrap', 'pacifier', 'peach', 'pear', 'quill', 
+                        'ribbon', 'simcard', 'speaker', 'starfish', 't-shirt', 'tamale', 'uniform', 'watch', 'whip', 'wig'):
             distinction_list.append(0)
         else:
             distinction_list.append(1)
     return distinction_list
 
-def get_value_man_made(stimulus_list): 
+def get_value_man_made_chatGPT(stimulus_list): 
+    distinction_list = []
+    for stimulus in stimulus_list:
+        #natural
+        if stimulus in ('pumpkin', 'bamboo', 'beaver', 'nest', 'bean', 'cheese', 'pear', 'monkey', 'wasp', 'rabbit', 
+                        'cow', 'starfish', 'horse', 'banana', 'mango', 'grape', 'chipmunk', 'alligator', 
+                         'iguana', 'butterfly', 'hippopotamus', 'dragonfly', 'stalagamite', 
+                         'peach', 'chest1'):
+            distinction_list.append(0)
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def get_value_entertainment_chatGPT(stimulus_list): 
+    distinction_list = []
+    for stimulus in stimulus_list:
+        if stimulus in ('pumpkin', 'boa', 'seesaw', 'ferriswheel', 'kazoo', 'hulahoop', 'ribbon',
+                         'television', 'crayon', 'piano', 'beachball', 'speaker', 'joystick', 'beer', 'boat'):
+             distinction_list.append(0)  
+        
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def get_value_transportation_chatGPT(stimulus_list): 
+    distinction_list = []
+    for stimulus in stimulus_list:
+        if stimulus in ('bulldozer', 'bobsled', 'bike', 'boat', 'helicopter', 'hovercraft'):
+             distinction_list.append(0)  
+        
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def get_value_food_chatGPT(stimulus_list): 
+    distinction_list = []
+    for stimulus in stimulus_list:
+        if stimulus in ('pumpkin', 'jam', 'bean', 'cheese', 'pear', 'banana', 'donut', 'lasagna', 'cow', 'cookie', 'peach', 'lemonade', 
+                        'fudge', 'marshmallow', 'brownie', 'grape', 'tamale', 'guacamole'):
+             distinction_list.append(0)  
+        
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def get_value_metal_pictures(stimulus_list): 
+    distinction_list = []
+    for stimulus in stimulus_list:
+       
+        if stimulus in ('bulldozer', 'cufflink', 'grate', 'watch', 'key', 'microscope', 'television', 'bike', 'headlamp', 
+                        'candelabra',  'piano', 'clipboard', 'speaker', 'crank', 'brace', 'spoon', 'axe', 'ashtray', 'typewriter', 'horseshoe',
+                          'pan', 'joystick', 'boat', 'bobsled', 'earring', 'hovercraft', 'seesaw', 'bench'):
+             distinction_list.append(0)  
+        
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def get_value_plastic_pictures(stimulus_list): 
     distinction_list = []
     for stimulus in stimulus_list:
         
-        if stimulus in ('cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse',  'monkey', 
-                        'rabbit', 'boa', 'alligator', 'butterfly', 'chest1', 'dragonfly',  'iguana', 'starfish', 'wasp',
-                        'bamboo', 'bean', 'banana', 'peach', 'pear', 'grape', 'mango', 'pumpkin'):
-            distinction_list.append(0)
+        if stimulus in ('beachball', 'blind', 'boa', 'brace', 'crank', 'earring', 'headlamp', 'hovercraft', 'hulahoop',
+                         'joystick', 'kazoo', 'microscope', 'pacifier', 'piano', 'ribbon', 'pacifier', 'shredder', 'simcard', 
+                         'television', 'typewriter',  'wig'):
+             distinction_list.append(0)  
+        
         else:
             distinction_list.append(1)
     return distinction_list
 
-def get_value_purpose(stimulus_list): 
+def get_value_natural_material_pictures(stimulus_list): 
     distinction_list = []
     for stimulus in stimulus_list:
-        # entertainment / recreational
-        if stimulus in ('beachball', 'beer', 'bobsled', 'crayon', 'ferriswheel', 'hulahoop', 'piano', 'seesaw'):
+        
+        if stimulus in ('pumpkin', 'bamboo', 'beaver', 'nest', 'bean', 'pear', 'banana', 'rabbit', 'cow', 'starfish', 
+                        'mango', 'ribbon', 'monkey', 'wasp', 'grape', 'chipmunk', 'alligator', 'boa', 'iguana', 'butterfly', 'hippopotamus', 
+                        'altar', 'bed', 'bench', 'clipboard', 'drawer', 'easel', 'guacamole', 'speaker', 'stalagmite'):
              distinction_list.append(0)  
-        # decorative
-        elif stimulus in ('candelabra', 'cufflink', 'earring', 'ribbon', 'wallpaper'): 
+        
+        else:
             distinction_list.append(1)
-        # transportation
-        elif stimulus in ('boat', 'bike', 'helicopter', 'hovercraft'): 
-            distinction_list.append(2)
-        # practical
-        elif stimulus in ('ashtray', 'axe', 'bed', 'bench', 'blind', 'brace', 'crank', 'bulldozer', 'clipboard', 'drain', 'drawer', 'easel', 'grate', 'headlamp',
-                          'jar', 'joystick', 'key', 'microscope', 'mosquitonet', 'mousetrap', 'pacifier', 'pan', 'shredder', 'simcard', 'speaker', 'spoon',
-                          'streetlight', 'tent', 'umbrella', 'watch', 'whip'): 
-            distinction_list.append(3)
-        #food
-        elif stimulus in ('banana', 'bean', 'grape', 'mango', 'peach', 'pear', 'pumpkin', 'brownie', 'cheese', 'cookie', 'donut', 'dough', 'fudge', 
-                          'guacamole', 'jam', 'lasagna', 'marshmallow', 'tamale'): 
-            distinction_list.append(4)
-        # no
-        #elif stimulus in ('altar', 'banana', 'beachball'): 
-         #   distinction_list.append(0)
+    return distinction_list
+
+def get_value_kitchen_chatGPT(stimulus_list): 
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('pumpkin', 'donut', 'jam', 'bean', 'cheese', 'pear', 'banana', 'lasagna', 'cow', 'cookie', 'peach', 'lemonade', 
+                        'fudge', 'marshmallow', 'brownie', 'grape', 'tamale', 'guacamole', 'jar', 'spoon', 'pan'):
+             distinction_list.append(0)  
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def get_value_livingroom_chatGPT(stimulus_list): 
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('key', 'drawer','television', 'jar','piano', 'lemonade','speaker', 'candelabra', 'wallpaper'):
+             distinction_list.append(0)  
+        
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def get_value_bedroom_chatGPT(stimulus_list): 
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('cufflink', 'watch', 'key', 'drawer', 'television', 't-shirt', 'uniform', 
+                         'dress', 'earring', 'bed', 'mosquitonet', 'wallpaper', 'speaker'):
+             distinction_list.append(0)  
+        
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def get_value_electricity_chatGPT(stimulus_list): 
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('shredder', 'television', 'headlamp', 'speaker', 'joystick', 'helicopter', 'ferriswheel', 'streetlight', 'hovercraft'):
+             distinction_list.append(0)  
+        
+        else:
+            distinction_list.append(1)
+    return distinction_list
+
+def get_value_habitat(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('beaver', 'starfish', 'alligator'):
+             distinction_list.append(0)  
+        elif stimulus in ('cow', 'chipmunk', 'hippopotamus', 'horse', 'monkey', 'rabbit', 'butterfly', 'iguana', 'wasp', 'dragonfly'):
+            distinction_list.append(1)
+        else: 
+            distinction_list.append(-1)
+    return distinction_list
+
+def get_value_carnivore_chatGPT(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ( 'alligator', 'dragonfly', 'starfish', 'wasp'):
+            distinction_list.append(0)  
+        elif stimulus in ('cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse', 'monkey', 'rabbit', 'butterfly', 'iguana'):
+            distinction_list.append(1)
         else:
             distinction_list.append(-1)
     return distinction_list
 
-def permutation_corr(v1, v2, method="spearman", iter=1000):
-
-    """
-    Conduct Permutation test for correlation coefficients
-
-    Parameters
-    ----------
-    v1 : array
-        Vector 1.
-    v2 : array
-        Vector 2.
-    method : string 'spearman' or 'pearson' or 'kendall' or 'similarity' or 'distance'. Default is 'spearman'.
-        The method to calculate the similarities.
-        If method='spearman', calculate the Spearman Correlations. If method='pearson', calculate the Pearson
-        Correlations. If methd='kendall', calculate the Kendall tau Correlations. If method='similarity', calculate the
-        Cosine Similarities. If method='distance', calculate the Euclidean Distances.
-    iter : int. Default is 1000.
-        The times for iteration.
-
-    Returns
-    -------
-    p : float
-        The permutation test result, p-value.
-    """
-
-    if len(v1) != len(v2):
-
-        return "Invalid input"
-
-    # permutation test
-
-    if method == "spearman":
-        rtest = spearmanr(v1, v2, axis = None)[0]
-
-        ni = 0
-
-        for i in range(iter):
-            shuffled_indices = np.random.permutation(len(v1))
-            v1shuffle = v1.take(shuffled_indices, 0).take(shuffled_indices, 1)#np.random.permutation(v1)
-            #v2shuffle = v2.take(shuffled_indices, 0).take(shuffled_indices, 1)
-            rperm = spearmanr(v1shuffle, v2, axis = None)[0]#spearmanr(v1shuffle_array, v2_array)[0]
-            if rperm > rtest:
-                ni = ni + 1
-
-    if method == "pearson":
+def get_value_herbivore_chatGPT(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
         
-        rtest = pearsonr(v1, v2)[0]
+        if stimulus in ('cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse', 'rabbit', 'butterfly', 'iguana'):
+            distinction_list.append(0)  
+        elif stimulus in ('alligator', 'monkey', 'starfish', 'wasp', 'dragonfly'):
+            distinction_list.append(1)
+        else:
+            distinction_list.append(-1)
+    return distinction_list
 
-        ni = 0
+def get_value_omnivore_chatGPT(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('monkey'):
+            distinction_list.append(0)  
+        elif stimulus in ('cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse', 'rabbit', 'butterfly', 'iguana',
+                           'alligator', 'dragonfly', 'starfish', 'wasp'):
+            distinction_list.append(1)
+        else:
+            distinction_list.append(-1)
+    return distinction_list
 
-        for i in range(iter):
-            v1shuffle = np.random.permutation(v1)
-            v2shuffle = np.random.permutation(v2)
-            rperm = pearsonr(v1shuffle, v2shuffle)[0]
+def get_value_mammal(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('monkey','cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse', 'rabbit' ):
+            distinction_list.append(0)  
+        elif stimulus in ('butterfly', 'iguana', 'alligator', 'dragonfly', 'starfish', 'wasp'):
+            distinction_list.append(1)
+        else:
+            distinction_list.append(-1)
+    return distinction_list
 
-            if rperm>rtest:
-                ni = ni + 1
+def get_value_mammal_all(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('monkey','cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse', 'rabbit' ):
+            distinction_list.append(0)  
+        else:
+            distinction_list.append(1)
+    return distinction_list
 
-    p = np.float64((ni+1)/(iter+1))
+def get_value_reptile(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('alligator','iguana'):
+            distinction_list.append(0)  
+        elif stimulus in ('monkey','cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse', 'rabbit' , 'butterfly', 'dragonfly', 'starfish', 'wasp'):
+            distinction_list.append(1)
+        else:
+            distinction_list.append(-1)
+    return distinction_list
 
-    return p
+def get_value_reptile_all(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('alligator','iguana'):
+            distinction_list.append(0)  
+        else:
+            distinction_list.append(1)
+    return distinction_list
 
+def get_value_invertebrate(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('butterfly', 'dragonfly', 'starfish', 'wasp'):
+            distinction_list.append(0)  
+        elif stimulus in ('monkey','cow', 'beaver', 'chipmunk', 'hippopotamus', 'horse', 'rabbit' , 'alligator','iguana'):
+            distinction_list.append(1)
+        else:
+            distinction_list.append(-1)
+    return distinction_list
+def get_value_invertebrate_all(stimulus_list):
+    distinction_list = []
+    for stimulus in stimulus_list:
+        
+        if stimulus in ('butterfly', 'dragonfly', 'starfish', 'wasp'):
+            distinction_list.append(0)  
+        else:
+            distinction_list.append(1)
+    return distinction_list
 
-' a function for calculating the Spearman correlation coefficient between two RDMs '
+# adapted from rsatoolbox bootstrap pattern to work for model fit bootstrapping
+def bootstrap_nnls(models, data, theta=None, method='cosine', N=1000,
+                           pattern_descriptor='index', rdm_descriptor='index',
+                           boot_noise_ceil=False):
+    """evaluates a models on data
+    performs bootstrapping over patterns to get a sampling distribution
 
-def rdm_correlation_spearman(RDM1, RDM2, rescale=False, permutation=False, iter=1000):
+    Args:
+        models(rsatoolbox.model.Model or list): models to be evaluated
+        data(rsatoolbox.rdm.RDMs): data to evaluate on
+        theta(numpy.ndarray): parameter vector for the models
+        method(string): comparison method to use
+        N(int): number of samples
+        pattern_descriptor(string): descriptor to group patterns for bootstrap
+        rdm_descriptor(string): descriptor to group patterns for noise
+            ceiling calculation
+
+    Returns:
+        numpy.ndarray: vector of evaluations
 
     """
-    Calculate the Spearman Correlation between two RDMs
-
-    Parameters
-    ----------
-    RDM1 : array [ncons, ncons]
-        The RDM 1.
-        The shape of RDM1 must be [n_cons, n_cons].
-        n_cons represent the number of conidtions.
-    RDM2 : array [ncons, ncons].
-        The RDM 2.
-        The shape of RDM2 must be [n_cons, n_cons].
-        n_cons represent the number of conidtions.
-    rescale : bool True or False. Default is False.
-        Rescale the values in RDM or not.
-        Here, the maximum-minimum method is used to rescale the values except for the values on the diagonal.
-    permutation : bool True or False. Default is False.
-        Conduct permutation test or not.
-    iter : int. Default is 1000.
-        The times for iteration.
-
-    Returns
-    -------
-    corr : array [r, p].
-        The Spearman Correlation result.
-        The shape of corr is [2], including a r-value and a p-value.
-    """
-
-    if len(np.shape(RDM1)) != 2 or len(np.shape(RDM2)) != 2 or np.shape(RDM1)[0] != np.shape(RDM1)[1] or \
-            np.shape(RDM2)[0] != np.shape(RDM2)[1]:
-
-        print("\nThe shapes of two RDMs should be [ncons, ncons]!\n")
-
-        return "Invalid input!"
-
-    # get number of conditions
-    cons = np.shape(RDM1)[0]
-
-    # calculate the number of value above the diagonal in RDM
-    n = int(cons*(cons-1)/2)
-
-    if rescale == True:
-
-        # flatten the RDM1
-        vrdm = np.reshape(RDM1, [cons*cons])
-        # array -> set -> list
-        svrdm = set(vrdm)
-        lvrdm = list(svrdm)
-        lvrdm.sort()
-
-        # get max & min
-        maxvalue = lvrdm[-1]
-        minvalue = lvrdm[1]
-
-        # rescale
-        if maxvalue != minvalue:
-
-            for i in range(cons):
-                for j in range(cons):
-
-                    # not on the diagnal
-                    if i != j:
-                        RDM1[i, j] = float((RDM1[i, j] - minvalue) / (maxvalue - minvalue))
-
-        # flatten the RDM2
-        vrdm = np.reshape(RDM2, [cons * cons])
-        # array -> set -> list
-        svrdm = set(vrdm)
-        lvrdm = list(svrdm)
-        lvrdm.sort()
-
-        # get max & min
-        maxvalue = lvrdm[-1]
-        minvalue = lvrdm[1]
-
-        # rescale
-        if maxvalue != minvalue:
-
-            for i in range(cons):
-                for j in range(cons):
-
-                    # not on the diagnal
-                    if i != j:
-                        RDM2[i, j] = float((RDM2[i, j] - minvalue) / (maxvalue - minvalue))
-
-    # initialize two vectors to store the values above the diagnal of two RDMs
-    v1 = np.zeros([n], dtype=np.float64)
-    v2 = np.zeros([n], dtype=np.float64)
-    # assignment
-    nn = 0
-    for i in range(cons-1):
-        for j in range(cons-1-i):
-            v1[nn] = RDM1[i, i+j+1]
-            v2[nn] = RDM2[i, i+j+1]
-            nn = nn + 1
-
-    # calculate the Spearman Correlation
-    rp = np.array(spearmanr(v1, v2))
-
-    if permutation == True:
-
-        rp[1] = permutation_corr(RDM1, RDM2, method="spearman", iter=iter)
-
-    return rp
-
-
-def get_rdm_0_1(stimuli_list, value_function):
-    distinction = value_function(stimuli_list)
-    unique, counts = np.unique(np.array(distinction), return_counts = True)
-    dic = dict(zip(unique, counts))
-    matrix_0_1 = np.zeros([len(distinction), len(distinction)], dtype=float)
-    for i in range(len(distinction)): 
-        for j in range(len(distinction)): 
-            if distinction[i] == distinction[j]: 
-                matrix_0_1[i][j] = 0
-            else: 
-                matrix_0_1[i][j] = 1
-    return matrix_0_1
-
-
+    models, evaluations, theta, _ = \
+        rsatoolbox.util.inference_util.input_check_model(models, theta, None, N)
+    noise_min = []
+    noise_max = []
+    for i in tqdm.trange(N):
+        sample, pattern_idx = \
+            rsatoolbox.inference. bootstrap_sample_pattern(data, pattern_descriptor)
+        df = pd.DataFrame(columns= [mod.name for mod in models])
+        if len(np.unique(pattern_idx)) >= 3:
+           
+            for j, mod in enumerate(models):
+                
+                rdm_pred = mod.predict_rdm(theta=theta[j])
+                rdm_pred = rdm_pred.subsample_pattern(pattern_descriptor,
+                                                      pattern_idx)
+                
+                vectors, y, non_nan_mask = rsatoolbox.util.rdm_utils._parse_nan_vectors(rdm_pred.get_vectors(), sample.get_vectors())
+                
+                if (len(np.unique(vectors[0])) != 1):
+                    df[mod.name] = stats.zscore(vectors[0])
+                else: 
+                    df[mod.name] = vectors[0]
+                
+            evaluations[i]= scipy.optimize.nnls(df, y[0])[0]
+            if boot_noise_ceil:
+                noise_min_sample, noise_max_sample = rsatoolbox.inference.noise_ceiling.boot_noise_ceiling(
+                    sample, method=method, rdm_descriptor=rdm_descriptor)
+                noise_min.append(noise_min_sample)
+                noise_max.append(noise_max_sample)
+        else:
+            evaluations[i, :] = np.nan
+            noise_min.append(np.nan)
+            noise_max.append(np.nan)
+    if boot_noise_ceil:
+        eval_ok = np.isfinite(evaluations[:, 0])
+        noise_ceil = np.array([noise_min, noise_max])
+        variances = np.cov(np.concatenate([evaluations[eval_ok, :].T,
+                                           noise_ceil[:, eval_ok]]))
+    else:
+        eval_ok = np.isfinite(evaluations[:, 0])
+        noise_ceil = np.array(rsatoolbox.inference.noise_ceiling.boot_noise_ceiling(
+            data, method=method, rdm_descriptor=rdm_descriptor))
+        variances = np.cov(evaluations[eval_ok, :].T)
+    dof = data.n_cond - 1
+    result = rsatoolbox.inference.Result(models, evaluations, method=method,
+                    cv_method='bootstrap_pattern_nnls', noise_ceiling=noise_ceil,
+                    variances=variances, dof=dof, n_rdm=None,
+                    n_pattern=data.n_cond)
+    result.n_rdm = data.n_rdm
+    return result

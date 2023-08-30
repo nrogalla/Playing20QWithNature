@@ -275,11 +275,12 @@ def permutation_test_nnls_explained_variance(models, data, theta=None,  N=1000):
         for i in range(len((data))):
             reg_nnls = LinearRegression(positive=True)
             d = data.get_vectors()[i]
+            
             red_score = reg_nnls.fit(df[df.columns[df.columns != col]],d).score(df[df.columns[df.columns != col]], d)
+            
             fit_test[k][i] = reg_nnls.fit(df, d).score(df, d) - red_score
-    
+        
     fit_test = np.average(fit_test, axis = 1)
-    
     # establish distribution and count times explained variance is higher or equal to test case
     counts = np.zeros(len(fit_test))
     for i in tqdm.trange(N):
@@ -304,6 +305,7 @@ def permutation_test_nnls_explained_variance(models, data, theta=None,  N=1000):
             for m in range(len(rdm_p_vectors)):
                 red_score = reg_nnls.fit(df[df.columns[df.columns != col]],rdm_p_vectors[m]).score(df[df.columns[df.columns != col]], rdm_p_vectors[m])
                 #full model - reduced model variance
+                
                 mod_e_var[m] = reg_nnls.fit(df, rdm_p_vectors[m]).score(df, rdm_p_vectors[m]) - red_score
             eval[k] = np.average(mod_e_var)
             if eval[k] >= fit_test[k]:

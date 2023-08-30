@@ -10,7 +10,7 @@ The features underlying human object representation are still largely unknown. W
 
 The folder 'notebooks' contains the analysis conducted and presents findings segmented into two notebooks which reflect the structure of the thesis (ChatGPT and fMRI analysis).
 
-The folder'src' contains the main functionality.
+The folder 'src' contains the main functionality.
 
 In the Folder 'src.ChatGPTAnalysis', functionality used for section 2 of the thesis can be found. 
 It is bisected into the main part and an extended version of the scipy.cluster.hierarchy.dendrogram method that allows for truncation by threshold and max cluster size and additionally offers functionality to exclude clusters of smaller size.

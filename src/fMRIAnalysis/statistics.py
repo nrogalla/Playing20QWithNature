@@ -325,9 +325,9 @@ def _plot_voxel_selection(df, xlabel = None, ylabel = None ):
     l = np.arange(0, 82, step=2)
     ax.set_xticks(l)
     if xlabel is not None: 
-        plt.xlabel(xlabel)
+        ax.set_xlabel(xlabel)
     if ylabel is not None: 
-        plt.xlabel(ylabel)
+        ax.set_ylabel(ylabel)
 
 def plot_correlation_to_nc(df_corr, df_p, category_name_list):
     '''
@@ -577,4 +577,4 @@ def plot_p_to_nc(response_data, meta_data, noise_ceil, category_name_list, numbe
         df[str(cutoff)] = p
         cutoff += Decimal('0.01')
     df.set_index('Model', inplace = True)
-    _plot_voxel_selection(df, 'Noise ceiling cutoff', 'P-value')
+    _plot_voxel_selection(df, xlabel ='Noise ceiling cutoff', ylabel = 'P-value')
